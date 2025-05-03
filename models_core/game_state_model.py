@@ -33,6 +33,26 @@ class SituationalModel:
             # In a real implementation, this would actually train a model
             # For now, we'll just set up some simple heuristics
             
+            # Store score difference effects
+            self.adjustment_data['score_diff'] = {
+                -3: {'mean_adj': 0.5, 'sigma_factor': 1.2},    # Down by 3+: +0.5 SOG, 20% more variance
+                -2: {'mean_adj': 0.4, 'sigma_factor': 1.15},   # Down by 2: +0.4 SOG, 15% more variance
+                -1: {'mean_adj': 0.2, 'sigma_factor': 1.1},    # Down by 1: +0.2 SOG, 10% more variance
+                0: {'mean_adj': 0.0, 'sigma_factor': 1.0},     # Tied: no adjustment
+                1: {'mean_adj': -0.1, 'sigma_factor': 0.95},   # Up by 1: -0.1 SOG, 5% less variance
+                2: {'mean_adj': -0.3, 'sigma_factor': 0.9},    # Up by 2: -0.3 SOG, 10% less variance
+                3: {'mean_adj': -0.5, 'sigma_factor': 0.9}     # Up by 3+: -0.5 SOG, 10% less variance
+            }
+            
+            # Store period effects
+            self.adjustment_data['period'] = {
+                1: {'mean_adj': 0.0, 'sigma_factor': 1.0},     # 1st period: no adjustment
+                2: {'mean_adj': 0.1, 'sigma_factor': 1.05},    # 2nd period: +0.1 SOG, 5% more variance
+                3: {'mean_adj': 0.2, 'sigma_factor': 1.1},     # 3rd period: +0.2 SOG, 10% more variance
+                4: {'mean_adj': 0.3, 'sigma_factor': 1.2},     # OT: +0.3 SOG, 20% more variance
+                5: {'mean_adj': 0.4, 'sigma_factor': 1.3}      # 2OT+: +0.4 SOG, 30% more variance
+            }
+            
             # Store time remaining effects (in seconds)
             self.adjustment_data['time_remaining'] = {
                 0: {'mean_adj': 0.4, 'sigma_factor': 1.3},      # Final minute: +0.4 SOG, 30% more variance
@@ -140,24 +160,4 @@ class SituationalModel:
             trailing_adj['sigma_factor']
         )
         
-        return {'mean_adj': mean_adj, 'sigma_factor': sigma_factor} score difference effects
-            self.adjustment_data['score_diff'] = {
-                -3: {'mean_adj': 0.5, 'sigma_factor': 1.2},    # Down by 3+: +0.5 SOG, 20% more variance
-                -2: {'mean_adj': 0.4, 'sigma_factor': 1.15},   # Down by 2: +0.4 SOG, 15% more variance
-                -1: {'mean_adj': 0.2, 'sigma_factor': 1.1},    # Down by 1: +0.2 SOG, 10% more variance
-                0: {'mean_adj': 0.0, 'sigma_factor': 1.0},     # Tied: no adjustment
-                1: {'mean_adj': -0.1, 'sigma_factor': 0.95},   # Up by 1: -0.1 SOG, 5% less variance
-                2: {'mean_adj': -0.3, 'sigma_factor': 0.9},    # Up by 2: -0.3 SOG, 10% less variance
-                3: {'mean_adj': -0.5, 'sigma_factor': 0.9}     # Up by 3+: -0.5 SOG, 10% less variance
-            }
-            
-            # Store period effects
-            self.adjustment_data['period'] = {
-                1: {'mean_adj': 0.0, 'sigma_factor': 1.0},     # 1st period: no adjustment
-                2: {'mean_adj': 0.1, 'sigma_factor': 1.05},    # 2nd period: +0.1 SOG, 5% more variance
-                3: {'mean_adj': 0.2, 'sigma_factor': 1.1},     # 3rd period: +0.2 SOG, 10% more variance
-                4: {'mean_adj': 0.3, 'sigma_factor': 1.2},     # OT: +0.3 SOG, 20% more variance
-                5: {'mean_adj': 0.4, 'sigma_factor': 1.3}      # 2OT+: +0.4 SOG, 30% more variance
-            }
-            
-            # Store
+        return {'mean_adj': mean_adj, 'sigma_factor': sigma_factor}
