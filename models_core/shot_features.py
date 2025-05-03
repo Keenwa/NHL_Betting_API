@@ -730,7 +730,14 @@ def validate_shot_data_integrity(shot_data: pd.DataFrame) -> bool:
                 df['is_post'] = df['hitPost'] == 1
             else:
                 df['is_post'] = False
-    
+        # ------------------------------------------------------------------
+    #  NEW: playoff flag (needed by downstream code)
+    # ------------------------------------------------------------------
+    if 'is_playoff' not in df.columns:
+        # MoneyPuck has a boolean/int column called 'playoffGame'
+        # (1 for playoff games, 0 for regular‑season).  Fallback to 0.
+        df['is_playoff'] = df.get('playoffGame', 0).fillna(0).astype(bool)
+        
     # Check if required columns now exist
     missing_shot_cols = [col for col in required_shot_cols if col not in df.columns]
     if missing_shot_cols:
