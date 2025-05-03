@@ -5,7 +5,7 @@ from typing import Dict, List, Tuple, Optional, Any
 import os
 import glob
 
-from shot_features import (
+from models_core.shot_features import (
     load_shot_data, 
     process_shots,
     compute_dynamic_weighted_mu_sigma,
@@ -18,7 +18,7 @@ from shot_features import (
     validate_shot_data_integrity
 )
 
-from game_state_model import SituationalModel
+from models_core.game_state_model import SituationalModel
 
 class EnhancedSOGModel:
     """
