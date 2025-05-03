@@ -5,7 +5,7 @@ from typing import Dict, List, Tuple, Optional, Any
 import os
 import glob
 
-from models_core.shot_features import (
+from shot_features import (
     load_shot_data, 
     process_shots,
     compute_dynamic_weighted_mu_sigma,
@@ -18,7 +18,7 @@ from models_core.shot_features import (
     validate_shot_data_integrity
 )
 
-from models_core.game_state_model import SituationalModel
+from game_state_model import SituationalModel
 
 class EnhancedSOGModel:
     """
@@ -44,8 +44,8 @@ class EnhancedSOGModel:
         self.league_avg_tempo = None
         self.league_avg_sa_per_game = None
         
-        # Situational model
-        self.situational_model = None
+        # Initialize situational model
+        self.situational_model = SituationalModel()
         self.situational_model_trained = False
         
         # Load and process data
@@ -74,7 +74,6 @@ class EnhancedSOGModel:
             
             print("Computing player statistics...")
             try:
-                # Use the fixed compute_dynamic_weighted_mu_sigma function to handle missing is_playoff column
                 self.player_stats = compute_dynamic_weighted_mu_sigma(self.processed_shots)
                 print(f"Computed statistics for {len(self.player_stats)} players")
             except Exception as e:
@@ -89,7 +88,6 @@ class EnhancedSOGModel:
             
             print("Building head-to-head matchup history...")
             try:
-                # Use the fixed build_player_matchup_history function to handle data type inconsistencies
                 self.h2h_stats = build_player_matchup_history(self.processed_shots)
                 print(f"Built matchup history with {len(self.h2h_stats)} player-team pairs")
             except Exception as e:
@@ -150,68 +148,85 @@ class EnhancedSOGModel:
             # Empty h2h stats
             self.h2h_stats = pd.DataFrame()
     
-    def _calculate_opponent_stats(self) -> pd.DataFrame:
-        """Derive tempo, SA/GP, block‑rate, etc. for every opponent."""
-        # ── shots / game ───────────────────────────────────────────────
-        team_shots = (
-            self.processed_shots
-            .groupby(['teamCode', 'game_id'])
-            .size()
-            .reset_index(name='shots')
-        )
-        shots_per_game = (
-            team_shots
-            .groupby('teamCode')['shots']
-            .mean()
-            .reset_index(name='shots_per_game')
-        )
-
-        # ── games played per team (used for tempo) ─────────────────────
-        games_per_team = (
-            team_shots
-            .groupby('teamCode')['game_id']
-            .nunique()
-            .reset_index(name='games')
-        )
-
-        # ── accumulate rows here, then build one DataFrame at the end ──
-        rows = []
-
+    def _load_opponent_stats(self):
+        """Load opponent team statistics from file or calculate from data."""
+        # Check if opponent stats file exists
+        opponent_file = os.path.join(self.data_dir, "opponent_stats.csv")
+        
+        if os.path.exists(opponent_file):
+            # Load from file
+            self.opponent_stats = pd.read_csv(opponent_file)
+        else:
+            # Calculate from shot data
+            print("Calculating opponent statistics from shot data...")
+            self.opponent_stats = self._calculate_opponent_stats()
+            
+            # Save for future use
+            self.opponent_stats.to_csv(opponent_file, index=False)
+    
+    def _calculate_opponent_stats(self):
+        """Calculate opponent statistics from shot data."""
+        # First, calculate shots per game for each team
+        team_shots = self.processed_shots.groupby(['teamCode', 'game_id']).size().reset_index(name='shots')
+        shots_per_game = team_shots.groupby('teamCode')['shots'].mean().reset_index(name='shots_per_game')
+        
+        # Calculate average tempo by team (events per game)
+        games_per_team = team_shots.groupby('teamCode')['game_id'].nunique().reset_index(name='games')
+        
+        # Group by team to calculate stats
+        team_stats = pd.DataFrame()
+        
+        # For each team, calculate:
         for team in self.processed_shots['teamCode'].unique():
-            team_mask   = self.processed_shots['teamCode'] == team
-            team_sog    = self.processed_shots.loc[team_mask, 'is_sog'].sum()
-            team_blocks = self.processed_shots.loc[team_mask, 'is_block'].sum()
-
-            block_rate = team_blocks / (team_sog + team_blocks) if (team_sog + team_blocks) else 0.0
-            spg        = shots_per_game.loc[
-                            shots_per_game['teamCode'] == team, 'shots_per_game'
-                         ].squeeze() if team in shots_per_game['teamCode'].values else 0.0
-            games      = games_per_team.loc[
-                            games_per_team['teamCode'] == team, 'games'
-                         ].squeeze() if team in games_per_team['teamCode'].values else 1
-            tempo      = len(self.processed_shots[team_mask]) / games if games else 60.0
-
-            rows.append(
-                {
-                    'teamCode'     : team,
-                    'tempo'        : tempo,
-                    'sa_per_game'  : spg,
-                    'block_rate'   : block_rate,
-                    'pp_time_share': 0.20,  # TODO: replace with real PP data
-                    'pk_weakness'  : 0.80,  # TODO: replace with real PK metric
-                }
-            )
-
-        # Build and return the final table
-        return pd.DataFrame(rows)
+            # Get team shots
+            team_sog = self.processed_shots[self.processed_shots['teamCode'] == team]['is_sog'].sum()
+            team_blocks = self.processed_shots[self.processed_shots['teamCode'] == team]['is_block'].sum()
+            
+            # Safely calculate block rate
+            block_rate = 0.0
+            if team_sog + team_blocks > 0:
+                block_rate = team_blocks / (team_sog + team_blocks)
+            
+            # Get shots per game
+            if team in shots_per_game['teamCode'].values:
+                spg = shots_per_game.loc[shots_per_game['teamCode'] == team, 'shots_per_game'].iloc[0]
+            else:
+                spg = 0.0
+            
+            # Get number of games
+            if team in games_per_team['teamCode'].values:
+                games = games_per_team.loc[games_per_team['teamCode'] == team, 'games'].iloc[0]
+            else:
+                games = 1
+            
+            # Calculate tempo (approximate)
+            tempo = 60.0  # Default value
+            if games > 0:
+                tempo = len(self.processed_shots[self.processed_shots['teamCode'] == team]) / games
+            
+            # Add to team stats
+            team_stats = pd.concat([
+                team_stats,
+                pd.DataFrame({
+                    'teamCode': [team],
+                    'tempo': [tempo],
+                    'sa_per_game': [spg],
+                    'block_rate': [block_rate],
+                    'pp_time_share': [0.2],  # Default value
+                    'pk_weakness': [0.8]     # Default value
+                })
+            ], ignore_index=True)
+        
+        return team_stats
     
     def _train_situational_model(self):
         """Train the situational model on historical data."""
         # Check if we have necessary game state data
-        if 'score_diff' in self.processed_shots.columns and 'time_remaining' in self.processed_shots.columns:
+        if ('score_diff' in self.processed_shots.columns and 
+            'time_remaining' in self.processed_shots.columns):
             # Train model
             self.situational_model.train(self.processed_shots)
-            self.situational_model_trained = True
+            self.situational_model_trained = self.situational_model.trained
         else:
             print("Warning: Insufficient game state data to train situational model")
             self.situational_model_trained = False
@@ -231,21 +246,6 @@ class EnhancedSOGModel:
     ) -> Dict[str, Any]:
         """
         Generate a comprehensive SOG projection for a player.
-        
-        Args:
-            player_id: Player ID
-            opponent_id: Opponent team ID
-            period: Current period
-            score_diff: Score difference (player team - opponent)
-            is_overtime: Whether game is in overtime
-            time_remaining: Time remaining in seconds
-            expected_pp: Expected power play opportunities
-            actual_pp: Actual power play opportunities
-            last_game_ev_toi: Even strength TOI in last game
-            lines: SOG lines to calculate probabilities for
-            
-        Returns:
-            Dictionary with comprehensive projection details
         """
         # Check if player exists
         player_data = self.player_stats[self.player_stats['shooterPlayerId'] == player_id]
@@ -322,14 +322,6 @@ class EnhancedSOGModel:
     ) -> float:
         """
         Calculate probability of trailing at end of game.
-        
-        Args:
-            score_diff: Current score difference
-            period: Current period
-            time_remaining: Time remaining in seconds
-            
-        Returns:
-            Probability of trailing (0-1)
         """
         # Already trailing
         if score_diff < 0:
@@ -375,22 +367,6 @@ class EnhancedSOGModel:
     ) -> Dict[str, float]:
         """
         Calculate edge between model probability and implied odds.
-        
-        Args:
-            player_id: Player ID
-            opponent_id: Opponent team ID
-            line: SOG line
-            american_odds: American odds format
-            period: Current period
-            score_diff: Score difference
-            is_overtime: Whether game is in overtime
-            time_remaining: Time remaining in seconds
-            expected_pp: Expected power play opportunities
-            actual_pp: Actual power play opportunities
-            last_game_ev_toi: Even strength TOI in last game
-            
-        Returns:
-            Dictionary with edge calculation details
         """
         # Generate projection
         projection = self.project_player(
@@ -462,14 +438,6 @@ class EnhancedSOGModel:
     ) -> pd.DataFrame:
         """
         Find edges in a dataframe of odds.
-        
-        Args:
-            odds_df: DataFrame with odds data
-            min_edge: Minimum edge threshold
-            game_state: Optional game state data to use for all projections
-            
-        Returns:
-            DataFrame with edges above threshold
         """
         results = []
         
@@ -535,13 +503,6 @@ class EnhancedSOGModel:
     ) -> pd.DataFrame:
         """
         Build ticket (parlay) recommendations from edges.
-        
-        Args:
-            edges_df: DataFrame with edges above threshold
-            max_legs: Maximum number of legs in a parlay
-            
-        Returns:
-            DataFrame with ticket recommendations
         """
         from itertools import combinations
         
@@ -605,12 +566,6 @@ class EnhancedSOGModel:
     def get_player_name(self, player_id: str) -> str:
         """
         Get player name from ID using skaters.csv if available.
-        
-        Args:
-            player_id: Player ID
-            
-        Returns:
-            Player name or ID if not found
         """
         # Check if skaters file exists
         skaters_file = os.path.join(self.data_dir, "skaters.csv")
@@ -630,12 +585,6 @@ class EnhancedSOGModel:
     def get_team_name(self, team_code: str) -> str:
         """
         Get team name from code using teams.csv if available.
-        
-        Args:
-            team_code: Team code
-            
-        Returns:
-            Team name or code if not found
         """
         # Check if teams file exists
         teams_file = os.path.join(self.data_dir, "teams.csv")
@@ -662,16 +611,6 @@ class EnhancedSOGModel:
     ) -> str:
         """
         Generate a detailed projection report as text.
-        
-        Args:
-            player_id: Player ID
-            opponent_id: Opponent team ID
-            line: SOG line
-            american_odds: American odds
-            **kwargs: Additional game state parameters
-            
-        Returns:
-            Detailed projection report as text
         """
         # Get projection
         projection = self.project_player(
