@@ -7,9 +7,9 @@ from scipy import stats
 # Add the project root to Python path to allow imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from enhanced_model import EnhancedSOGModel
+from models_core.enhanced_model import EnhancedSOGModel
 from model_validation import SOGModelValidator
-import backtest_utils
+import models_core.backtest_utils
 
 def main():
     # Initialize model
