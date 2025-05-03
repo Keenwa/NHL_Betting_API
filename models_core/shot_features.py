@@ -19,21 +19,15 @@ def compute_dynamic_weighted_mu_sigma(
     """
     Compute dynamically weighted mean (μ) and std (σ) of SOG per game with 
     exponential decay for older games and importance boost for playoff games.
-    
-    Args:
-        shots_df: DataFrame with shot data
-        player_col: Column with player IDs
-        game_col: Column with game IDs
-        season_col: Column with seasons
-        playoff_col: Column indicating playoff games
-        sog_col: Column with SOG indicator
-        team_col: Column with team codes
-        recency_factor: Exponential decay factor for older games (0-1)
-        playoff_boost: Importance multiplier for playoff games
-        
-    Returns:
-        DataFrame with columns [player_col, team_col, 'mu', 'sigma']
     """
+    # Check if playoff column exists
+    if playoff_col not in shots_df.columns:
+        # Create is_playoff column based on season format if needed
+        if season_col in shots_df.columns:
+            shots_df[playoff_col] = shots_df[season_col].astype(str).str.endswith('P')
+        else:
+            shots_df[playoff_col] = False
+    
     # 1) per‐game SOG counts
     counts = (
         shots_df
@@ -43,7 +37,6 @@ def compute_dynamic_weighted_mu_sigma(
     )
     
     # 2) Add game sequence - assuming game_id increases chronologically
-    # If not, you would need to use actual game dates
     counts = counts.sort_values([player_col, game_col])
     counts["game_seq"] = counts.groupby(player_col).cumcount()
     
@@ -93,509 +86,12 @@ def compute_dynamic_weighted_mu_sigma(
     
     return pd.DataFrame(results)
 
-
-def apply_opponent_context_with_h2h(
-    mu_df: pd.DataFrame,
-    opponent_df: pd.DataFrame,
-    h2h_df: pd.DataFrame,  # Head-to-head stats
-    league_avg_tempo: float,
-    league_avg_sa_per_game: float,
-    player_col: str = "shooterPlayerId",
-    team_col: str = "teamCode",
-    opponent_col: str = "opponent",
-    h2h_weight: float = 0.3  # Weight for head-to-head data
-) -> pd.DataFrame:
-    """
-    Apply opponent context adjustments to player mean and std,
-    incorporating head-to-head history.
-    
-    Args:
-        mu_df: DataFrame with player mu/sigma
-        opponent_df: DataFrame with opponent stats
-        h2h_df: DataFrame with head-to-head statistics
-        league_avg_tempo: NHL average tempo
-        league_avg_sa_per_game: NHL average shots against per game
-        player_col: Column with player IDs
-        team_col: Column with team codes
-        opponent_col: Column with opponent codes
-        h2h_weight: Weight for head-to-head data (0-1)
-        
-    Returns:
-        DataFrame with adjusted mu/sigma
-    """
-    # Cross join players with opponents
-    players = mu_df.copy()
-    opp = opponent_df.copy()
-    
-    # Create a key for joining
-    players["key"] = 1
-    opp["key"] = 1
-    
-    # Cross join
-    df = pd.merge(players, opp, on="key", suffixes=("", "_opp"))
-    df = df.drop(columns=["key"])
-    
-    # Rename opponent columns for clarity
-    df = df.rename(columns={
-        f"{team_col}_opp": opponent_col,
-        "tempo_opp": "tempo",
-        "sa_per_game_opp": "sa_per_game",
-        "block_rate_opp": "block_rate",
-    })
-    
-    # Apply pace multiplier
-    df["mu_pace"] = df["mu"] * (df["tempo"] / league_avg_tempo)
-    
-    # Apply SA/GP adjustment
-    sa_diff = df["sa_per_game"] - league_avg_sa_per_game
-    df["mu_sa"] = df["mu_pace"] + np.where(abs(sa_diff) >= 2, 0.15 * (sa_diff / 2), 0)
-    
-    # Apply block rate adjustment
-    df["mu_block"] = df["mu_sa"] + np.where(
-        df["block_rate"] > 0.30, -0.25,
-        np.where(df["block_rate"] < 0.22, 0.15, 0)
-    )
-    
-    df["sigma_block"] = df["sigma"] * np.where(df["block_rate"] > 0.30, 1.1, 1.0)
-    
-    # NEW: Incorporate head-to-head data
-    if not h2h_df.empty:
-        # Merge h2h data
-        df = df.merge(
-            h2h_df[[player_col, opponent_col, 'h2h_mu', 'h2h_games']],
-            on=[player_col, opponent_col],
-            how='left'
-        )
-        
-        # Apply h2h adjustment where data exists
-        h2h_mask = df['h2h_mu'].notna()
-        
-        if h2h_mask.any():
-            # Calculate confidence factor based on number of h2h games
-            df.loc[h2h_mask, 'h2h_confidence'] = np.minimum(
-                df.loc[h2h_mask, 'h2h_games'] / 10, 1.0
-            )
-            
-            # Apply weighted blend
-            df.loc[h2h_mask, 'mu_h2h'] = (
-                (1 - (h2h_weight * df.loc[h2h_mask, 'h2h_confidence'])) * df.loc[h2h_mask, 'mu_block'] +
-                (h2h_weight * df.loc[h2h_mask, 'h2h_confidence']) * df.loc[h2h_mask, 'h2h_mu']
-            )
-        else:
-            df['mu_h2h'] = df['mu_block']
-    else:
-        # No h2h data available
-        df['mu_h2h'] = df['mu_block']
-    
-    # Apply shutdown matchup flag
-    if "is_shadowed" in df.columns:
-        df["mu_shadow"] = df["mu_h2h"] + np.where(df["is_shadowed"], -0.25, 0)
-    else:
-        df["mu_shadow"] = df["mu_h2h"]
-    
-    # Calculate final mu/sigma with all opponent context
-    df["mu_opponent"] = df["mu_shadow"]
-    df["sigma_opponent"] = df["sigma_block"]
-    
-    # Select relevant columns
-    result_df = df[[
-        player_col, team_col, opponent_col, 
-        "mu", "sigma", "mu_opponent", "sigma_opponent"
-    ]]
-    
-    return result_df
-
-
-def apply_game_state_adjustments(
-    proj_df: pd.DataFrame,
-    game_state: pd.DataFrame,
-    player_col: str = "shooterPlayerId",
-    team_col: str = "teamCode",
-) -> pd.DataFrame:
-    """
-    Apply game-state adjustments to player mean and std:
-    • Lead-protect taper: if team leads by ≥2 after P2, top shooters −0.3 SOG
-    • Chase-mode bonus: if team is 60%+ likely to trail (or does), stars +0.4 SOG
-    • Overtime/comeback for Canes: add +0.3 SOG to top six in multi-OT or big deficit
-    
-    Args:
-        proj_df: DataFrame with player projections including opponent adjustments
-        game_state: DataFrame with game state information
-        player_col: Column with player IDs
-        team_col: Column with team codes
-        
-    Returns:
-        DataFrame with game-state adjusted mu/sigma
-    """
-    df = proj_df.merge(game_state, on=[player_col, team_col], how="left")
-    
-    # Lead-protect taper
-    # If team leads by ≥2 after P2, top shooters −0.3 SOG
-    lead_protect = (
-        (df["period"] > 2) & 
-        (df["score_diff"] >= 2) & 
-        (df["is_top_shooter"] == True)
-    )
-    df["mu_lead"] = df["mu_opponent"] + np.where(lead_protect, -0.3, 0)
-    
-    # Chase-mode bonus
-    # If team is 60%+ likely to trail (or does), stars +0.4 SOG
-    chase_mode = (
-        ((df["trail_probability"] >= 0.6) | (df["score_diff"] < 0)) & 
-        (df["is_star"] == True)
-    )
-    df["mu_chase"] = df["mu_lead"] + np.where(chase_mode, 0.4, 0)
-    
-    # Overtime/comeback for Canes
-    # Add +0.3 SOG to top six in multi-OT or big deficit
-    canes_bonus = (
-        (df[team_col] == "CAR") & 
-        ((df["is_overtime"] == True) | (df["score_diff"] <= -2)) & 
-        (df["is_top_six"] == True)
-    )
-    df["mu_canes"] = df["mu_chase"] + np.where(canes_bonus, 0.3, 0)
-    
-    # Increase variance in OT
-    df["sigma_ot"] = df["sigma_opponent"] * np.where(df["is_overtime"], 1.15, 1.0)
-    
-    # Calculate final game-state adjusted mu/sigma
-    df["mu_game_state"] = df["mu_canes"]
-    df["sigma_game_state"] = df["sigma_ot"]
-    
-    return df
-
-
-def apply_advanced_game_state_adjustments(
-    proj_df: pd.DataFrame,
-    game_state: pd.DataFrame,
-    situational_model: Optional[Any] = None,
-    player_col: str = "shooterPlayerId",
-    team_col: str = "teamCode",
-) -> pd.DataFrame:
-    """
-    Apply advanced game-state adjustments to player mean and std using
-    both rules-based and model-based approaches.
-    
-    Args:
-        proj_df: DataFrame with player projections including opponent adjustments
-        game_state: DataFrame with game state information
-        situational_model: Optional trained situational model
-        player_col: Column with player IDs
-        team_col: Column with team codes
-        
-    Returns:
-        DataFrame with game-state adjusted mu/sigma
-    """
-    # Start with basic game state adjustments
-    df = apply_game_state_adjustments(proj_df, game_state)
-    
-    # Apply model-based adjustments if model is provided
-    if situational_model is not None:
-        for idx, row in df.iterrows():
-            player_id = row[player_col]
-            period = game_state.loc[idx, 'period']
-            score_diff = game_state.loc[idx, 'score_diff']
-            time_remaining = game_state.loc[idx, 'time_remaining'] if 'time_remaining' in game_state.columns else 600
-            is_overtime = game_state.loc[idx, 'is_overtime']
-            
-            # Get model prediction
-            adjustment = situational_model.predict_adjustment(
-                player_id=player_id,
-                period=period,
-                score_diff=score_diff,
-                time_remaining=time_remaining,
-                is_overtime=is_overtime
-            )
-            
-            # Apply adjustments
-            df.loc[idx, 'mu_situation'] = df.loc[idx, 'mu_game_state'] + adjustment['mean_adj']
-            df.loc[idx, 'sigma_situation'] = df.loc[idx, 'sigma_game_state'] * adjustment['sigma_factor']
-    else:
-        # No model, use existing values
-        df['mu_situation'] = df['mu_game_state']
-        df['sigma_situation'] = df['sigma_game_state']
-    
-    # Advanced coach-specific adjustments
-    # Add team coach tendencies if available
-    if 'coach_id' in game_state.columns:
-        # This would use a lookup table of coach tendencies
-        coach_tendencies = {
-            # Example: coach ID -> adjustment factor for 3rd period trailing
-            'c001': 0.2,  # Coach pulls goalie earlier, more aggressive
-            'c002': -0.1,  # Coach is more defensive when trailing
-        }
-        
-        for idx, row in df.iterrows():
-            coach_id = game_state.loc[idx, 'coach_id']
-            if coach_id in coach_tendencies and game_state.loc[idx, 'period'] >= 3:
-                if game_state.loc[idx, 'score_diff'] < 0:  # Trailing
-                    df.loc[idx, 'mu_situation'] += coach_tendencies[coach_id]
-    
-    # Set final game-state adjusted mu/sigma
-    df['mu_game_state_final'] = df['mu_situation']
-    df['sigma_game_state_final'] = df['sigma_situation']
-    
-    return df
-
-
-def apply_player_specific_quirks(
-    proj_df: pd.DataFrame,
-    player_col: str = "shooterPlayerId",
-) -> pd.DataFrame:
-    """
-    Apply player-specific quirks to mean and std:
-    • High-post shooters (Strome, McDavid): mean −0.05 SOG, σ wider
-    • Power-play share: ±0.15 SOG for every PP above/below 2 expected
-    • Rolling last-game EV-TOI directly scales mean
-    
-    Args:
-        proj_df: DataFrame with player projections including game-state adjustments
-        player_col: Column with player IDs
-        
-    Returns:
-        DataFrame with player-specific adjusted mu/sigma
-    """
-    df = proj_df.copy()
-    
-    # High-post shooters
-    if "is_high_post_shooter" in df.columns:
-        df["mu_post"] = df["mu_game_state"] + np.where(df["is_high_post_shooter"], -0.05, 0)
-        df["sigma_post"] = df["sigma_game_state"] * np.where(df["is_high_post_shooter"], 1.1, 1.0)
-    else:
-        # Default if column doesn't exist
-        df["mu_post"] = df["mu_game_state"]
-        df["sigma_post"] = df["sigma_game_state"]
-    
-    # Power-play share
-    if "actual_pp" in df.columns and "expected_pp" in df.columns:
-        pp_diff = df["actual_pp"] - df["expected_pp"]
-        df["mu_pp"] = df["mu_post"] + 0.15 * (pp_diff / 2)
-    else:
-        # Default if columns don't exist
-        df["mu_pp"] = df["mu_post"]
-    
-    # Rolling last-game EV-TOI
-    # Default to 1.0 (no change) if no TOI data
-    df["toi_factor"] = 1.0
-    
-    # Where we have both last game TOI and average TOI
-    if "last_game_ev_toi" in df.columns and "avg_ev_toi" in df.columns:
-        mask = (df["last_game_ev_toi"].notna()) & (df["avg_ev_toi"] > 0)
-        df.loc[mask, "toi_factor"] = df.loc[mask, "last_game_ev_toi"] / df.loc[mask, "avg_ev_toi"]
-    
-    # Apply TOI factor to mean
-    df["mu_toi"] = df["mu_pp"] * df["toi_factor"]
-    
-    # Calculate final player-specific adjusted mu/sigma
-    df["mu_player"] = df["mu_toi"]
-    df["sigma_player"] = df["sigma_post"]
-    
-    return df
-
-
-def calculate_final_projection(
-    player_df: pd.DataFrame,
-    player_col: str = "shooterPlayerId",
-) -> pd.DataFrame:
-    """
-    Calculate final projections for all players.
-    
-    Args:
-        player_df: DataFrame with all player adjustments
-        player_col: Column with player IDs
-        
-    Returns:
-        DataFrame with final projections
-    """
-    # Ensure all adjustment columns exist
-    # If not, use the previous stage's values
-    result_df = player_df.copy()
-    
-    if "mu_opponent" not in result_df.columns:
-        result_df["mu_opponent"] = result_df["mu"]
-        result_df["sigma_opponent"] = result_df["sigma"]
-    
-    if "mu_game_state" not in result_df.columns:
-        result_df["mu_game_state"] = result_df["mu_opponent"]
-        result_df["sigma_game_state"] = result_df["sigma_opponent"]
-    
-    if "mu_player" not in result_df.columns:
-        result_df["mu_player"] = result_df["mu_game_state"]
-        result_df["sigma_player"] = result_df["sigma_game_state"]
-    
-    # Set final values
-    result_df["mu_final"] = result_df["mu_player"]
-    result_df["sigma_final"] = result_df["sigma_player"]
-    
-    # Select relevant columns for output
-    cols_to_keep = [
-        player_col, "teamCode"
-    ]
-    
-    # Add opponent if it exists
-    if "opponent" in result_df.columns:
-        cols_to_keep.append("opponent")
-    
-    # Add all mu/sigma columns
-    mu_sigma_cols = [
-        "mu", "sigma",                          # Base weighted stats
-        "mu_opponent", "sigma_opponent",        # After opponent context
-        "mu_game_state", "sigma_game_state",    # After game state
-        "mu_player", "sigma_player",            # After player quirks
-        "mu_final", "sigma_final"               # Final values
-    ]
-    
-    # Add columns that exist
-    for col in mu_sigma_cols:
-        if col in result_df.columns:
-            cols_to_keep.append(col)
-    
-    return result_df[cols_to_keep]
-
-
-def calculate_final_projection_with_confidence(
-    player_df: pd.DataFrame,
-    lines: List[float] = [0.5, 1.5, 2.5, 3.5, 4.5],
-    confidence_levels: List[float] = [0.80, 0.90, 0.95],
-    player_col: str = "shooterPlayerId"
-) -> pd.DataFrame:
-    """
-    Calculate final projections for all players with confidence intervals.
-    
-    Args:
-        player_df: DataFrame with all player adjustments
-        lines: List of SOG lines to calculate probabilities for
-        confidence_levels: List of confidence levels for intervals
-        player_col: Column with player IDs
-        
-    Returns:
-        DataFrame with final projections and confidence intervals
-    """
-    # Start with standard final projection
-    result_df = calculate_final_projection(player_df, player_col)
-    
-    # Add probabilities for each line
-    for line in lines:
-        line_str = str(line).replace('.', '_')
-        result_df[f'p_over_{line_str}'] = result_df.apply(
-            lambda row: stats.norm.sf(line + 0.5, loc=row['mu_final'], scale=row['sigma_final']),
-            axis=1
-        )
-    
-    # Calculate confidence intervals
-    for i, row in result_df.iterrows():
-        # Store confidence intervals for a representative line (e.g., 2.5)
-        key_line = 2.5
-        key_line_str = '2_5'
-        
-        intervals = calculate_confidence_intervals(
-            mu=row['mu_final'],
-            sigma=row['sigma_final'],
-            line=key_line,
-            confidence_levels=confidence_levels
-        )
-        
-        # Add confidence intervals to result
-        for level in confidence_levels:
-            level_str = str(int(level * 100))
-            result_df.at[i, f'mu_lower_{level_str}'] = intervals['intervals'][level]['mean_lower']
-            result_df.at[i, f'mu_upper_{level_str}'] = intervals['intervals'][level]['mean_upper']
-            result_df.at[i, f'p_over_{key_line_str}_lower_{level_str}'] = intervals['intervals'][level]['prob_lower']
-            result_df.at[i, f'p_over_{key_line_str}_upper_{level_str}'] = intervals['intervals'][level]['prob_upper']
-    
-    return result_df
-
-
-def load_shot_data(data_dir: str = "data") -> pd.DataFrame:
-    """
-    Load all shot CSVs from the shot_data folder.
-    
-    Args:
-        data_dir: Directory containing shot data
-        
-    Returns:
-        DataFrame with shot data
-    """
-    shot_dir = os.path.join(data_dir, "shot_data")
-    if not os.path.exists(shot_dir):
-        print(f"Shot data directory not found: {shot_dir}")
-        # Create a minimal dummy DataFrame for testing
-        return pd.DataFrame({
-            'game_id': [1001, 1002, 1003],
-            'teamCode': ['WSH', 'EDM', 'COL'],
-            'shooterPlayerId': ['8471675', '8478402', '8471214'],
-            'event': ['SHOT', 'GOAL', 'MISS'],
-            'shotWasOnGoal': [1, 1, 0],
-            'period': [1, 2, 3]
-        })
-    
-    csv_paths = glob.glob(os.path.join(shot_dir, "**", "*.csv"), recursive=True)
-    
-    if not csv_paths:
-        print(f"No shot-data CSVs found in {shot_dir}")
-        # Try to extract from ZIP files if they exist
-        zip_paths = glob.glob(os.path.join(shot_dir, "*.zip"))
-        if zip_paths:
-            print(f"Found {len(zip_paths)} ZIP files. Attempting to extract...")
-            import zipfile
-            for zip_path in zip_paths:
-                try:
-                    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                        zip_ref.extractall(shot_dir)
-                    print(f"Extracted {zip_path}")
-                except Exception as e:
-                    print(f"Error extracting {zip_path}: {e}")
-            
-            # Try to find CSVs again
-            csv_paths = glob.glob(os.path.join(shot_dir, "**", "*.csv"), recursive=True)
-    
-    if not csv_paths:
-        print("Still no CSV files found. Using dummy data for testing.")
-        return pd.DataFrame({
-            'game_id': [1001, 1002, 1003],
-            'teamCode': ['WSH', 'EDM', 'COL'],
-            'shooterPlayerId': ['8471675', '8478402', '8471214'],
-            'event': ['SHOT', 'GOAL', 'MISS'],
-            'shotWasOnGoal': [1, 1, 0],
-            'period': [1, 2, 3]
-        })
-    
-    df_list = []
-    for path in csv_paths:
-        try:
-            df = pd.read_csv(path)
-            df_list.append(df)
-        except Exception as e:
-            print(f"Error loading {path}: {e}")
-            continue
-    
-    if not df_list:
-        print("Failed to load any CSV files. Using dummy data for testing.")
-        return pd.DataFrame({
-            'game_id': [1001, 1002, 1003],
-            'teamCode': ['WSH', 'EDM', 'COL'],
-            'shooterPlayerId': ['8471675', '8478402', '8471214'],
-            'event': ['SHOT', 'GOAL', 'MISS'],
-            'shotWasOnGoal': [1, 1, 0],
-            'period': [1, 2, 3]
-        })
-    
-    return pd.concat(df_list, ignore_index=True)
-
-
 def process_shots(df: pd.DataFrame) -> pd.DataFrame:
     """
     Process shot data to identify SOG, MISS, BLOCK, and POST.
     Also adds zone information for more detailed analysis.
-    
-    Args:
-        df: DataFrame with shot data
-        
-    Returns:
-        Processed DataFrame with shot classification and zones
     """
-    # Create a new dataframe instead of modifying in place
-    # This avoids fragmentation warnings
+    # Create a copy to avoid modifying the original
     result_columns = {}
     
     # Copy original columns
@@ -671,16 +167,80 @@ def process_shots(df: pd.DataFrame) -> pd.DataFrame:
     # Create a new DataFrame with all columns
     return pd.DataFrame(result_columns)
 
+def load_shot_data(data_dir: str = "data") -> pd.DataFrame:
+    """
+    Load all shot CSVs from the shot_data folder.
+    """
+    shot_dir = os.path.join(data_dir, "shot_data")
+    
+    if not os.path.exists(shot_dir):
+        print(f"Shot data directory not found: {shot_dir}")
+        # Create a minimal dummy DataFrame for testing
+        return pd.DataFrame({
+            'game_id': [1001, 1002, 1003],
+            'teamCode': ['WSH', 'EDM', 'COL'],
+            'shooterPlayerId': ['8471675', '8478402', '8471214'],
+            'event': ['SHOT', 'GOAL', 'MISS'],
+            'shotWasOnGoal': [1, 1, 0],
+            'period': [1, 2, 3]
+        })
+    
+    csv_paths = glob.glob(os.path.join(shot_dir, "**", "*.csv"), recursive=True)
+    
+    if not csv_paths:
+        print(f"No shot-data CSVs found in {shot_dir}")
+        # Try to extract from ZIP files if they exist
+        zip_paths = glob.glob(os.path.join(shot_dir, "*.zip"))
+        if zip_paths:
+            print(f"Found {len(zip_paths)} ZIP files. Attempting to extract...")
+            import zipfile
+            for zip_path in zip_paths:
+                try:
+                    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                        zip_ref.extractall(shot_dir)
+                    print(f"Extracted {zip_path}")
+                except Exception as e:
+                    print(f"Error extracting {zip_path}: {e}")
+            
+            # Try to find CSVs again
+            csv_paths = glob.glob(os.path.join(shot_dir, "**", "*.csv"), recursive=True)
+    
+    if not csv_paths:
+        print("Still no CSV files found. Using dummy data for testing.")
+        return pd.DataFrame({
+            'game_id': [1001, 1002, 1003],
+            'teamCode': ['WSH', 'EDM', 'COL'],
+            'shooterPlayerId': ['8471675', '8478402', '8471214'],
+            'event': ['SHOT', 'GOAL', 'MISS'],
+            'shotWasOnGoal': [1, 1, 0],
+            'period': [1, 2, 3]
+        })
+    
+    df_list = []
+    for path in csv_paths:
+        try:
+            df = pd.read_csv(path)
+            df_list.append(df)
+        except Exception as e:
+            print(f"Error loading {path}: {e}")
+            continue
+    
+    if not df_list:
+        print("Failed to load any CSV files. Using dummy data for testing.")
+        return pd.DataFrame({
+            'game_id': [1001, 1002, 1003],
+            'teamCode': ['WSH', 'EDM', 'COL'],
+            'shooterPlayerId': ['8471675', '8478402', '8471214'],
+            'event': ['SHOT', 'GOAL', 'MISS'],
+            'shotWasOnGoal': [1, 1, 0],
+            'period': [1, 2, 3]
+        })
+    
+    return pd.concat(df_list, ignore_index=True)
 
 def validate_shot_data_integrity(shot_data: pd.DataFrame) -> bool:
     """
     Verify that team-SOG + MISS + BLOCK + POST = total attempts after every game.
-    
-    Args:
-        shot_data: DataFrame with shot data
-        
-    Returns:
-        True if integrity check passes, False otherwise
     """
     # Make a copy to avoid modifying the original
     df = shot_data.copy()
@@ -701,77 +261,34 @@ def validate_shot_data_integrity(shot_data: pd.DataFrame) -> bool:
         print("Warning: Missing team identifier column")
         return False
     
-    # Check required shot type columns and create them if possible
-    required_shot_cols = ['is_sog', 'is_miss', 'is_block', 'is_post']
-    missing_shot_cols = [col for col in required_shot_cols if col not in df.columns]
+    # Ensure shot flags exist
+    for col in ['is_sog', 'is_miss', 'is_block', 'is_post']:
+        if col not in df.columns:
+            print(f"Warning: Missing '{col}' column")
+            return False
     
-    if missing_shot_cols:
-        print(f"Warning: Missing shot type columns: {missing_shot_cols}")
-        
-        # Try to create missing columns if we have the base data
-        if 'event' in df.columns:
-            if 'is_sog' not in df.columns:
-                if 'shotWasOnGoal' in df.columns:
-                    df['is_sog'] = ((df['event'] == 'SHOT') & (df['shotWasOnGoal'] == 1)) | (df['event'] == 'GOAL')
-                else:
-                    df['is_sog'] = (df['event'] == 'SHOT') | (df['event'] == 'GOAL')
-            
-            if 'is_miss' not in df.columns:
-                if 'shotWasOnGoal' in df.columns:
-                    df['is_miss'] = (df['event'] == 'MISS') | ((df['event'] == 'SHOT') & (df['shotWasOnGoal'] == 0))
-                else:
-                    df['is_miss'] = (df['event'] == 'MISS')
-            
-            if 'is_block' not in df.columns:
-                df['is_block'] = (df['event'] == 'BLOCK')
-        
-        if 'is_post' not in df.columns:
-            if 'hitPost' in df.columns:
-                df['is_post'] = df['hitPost'] == 1
-            else:
-                df['is_post'] = False
-        # ------------------------------------------------------------------
-    #  NEW: playoff flag (needed by downstream code)
-    # ------------------------------------------------------------------
-    if 'is_playoff' not in df.columns:
-        # MoneyPuck has a boolean/int column called 'playoffGame'
-        # (1 for playoff games, 0 for regular‑season).  Fallback to 0.
-        df['is_playoff'] = df.get('playoffGame', 0).fillna(0).astype(bool)
-        
-    # Check if required columns now exist
-    missing_shot_cols = [col for col in required_shot_cols if col not in df.columns]
-    if missing_shot_cols:
-        print(f"Error: Unable to create required columns: {missing_shot_cols}")
-        return False
-    
-    # Check for count column
-    count_col = None
-    if 'shotID' in df.columns:
-        count_col = 'shotID'
-    elif 'id' in df.columns:
-        count_col = 'id'
-    
-    if count_col is None:
-        print("Creating synthetic shot ID column for counting")
-        df['shotID'] = range(len(df))
-        count_col = 'shotID'
-    
-    # Perform integrity check
     try:
         # Count SOG + MISS + BLOCK + POST
-        agg_dict = {col: 'sum' for col in required_shot_cols if col in df.columns}
+        game_totals = df.groupby(id_cols).agg({
+            'is_sog': 'sum',
+            'is_miss': 'sum', 
+            'is_block': 'sum',
+            'is_post': 'sum'
+        }).reset_index()
         
-        # Add count of total rows
-        game_totals = df.groupby(id_cols).agg(agg_dict)
-        game_totals['total_attempts'] = df.groupby(id_cols)[count_col].count()
+        # Count total attempts
+        total_attempts = df.groupby(id_cols).size().reset_index(name='total_attempts')
         
-        # Sum up the shot type columns
-        available_cols = [col for col in required_shot_cols if col in game_totals.columns]
-        if not available_cols:
-            print("Error: No shot type columns available")
-            return False
+        # Merge with totals
+        game_totals = game_totals.merge(total_attempts, on=id_cols)
         
-        game_totals['calculated_attempts'] = game_totals[available_cols].sum(axis=1)
+        # Calculate sum of components
+        game_totals['calculated_attempts'] = (
+            game_totals['is_sog'] + 
+            game_totals['is_miss'] + 
+            game_totals['is_block'] + 
+            game_totals['is_post']
+        )
         
         # Check for mismatches
         mismatches = game_totals[game_totals['total_attempts'] != game_totals['calculated_attempts']]
@@ -788,16 +305,9 @@ def validate_shot_data_integrity(shot_data: pd.DataFrame) -> bool:
         print(f"Error during integrity check: {e}")
         return False
 
-
 def get_nhl_averages(shot_data: pd.DataFrame) -> Tuple[float, float]:
     """
     Calculate NHL average tempo and shots against per game.
-    
-    Args:
-        shot_data: DataFrame with shot data
-        
-    Returns:
-        Tuple of (avg_tempo, avg_sa_per_game)
     """
     try:
         # Process shots
@@ -817,7 +327,6 @@ def get_nhl_averages(shot_data: pd.DataFrame) -> Tuple[float, float]:
         # Return default values
         return 60.0, 30.0
 
-
 def build_player_matchup_history(
     shots_df: pd.DataFrame,
     player_col: str = "shooterPlayerId",
@@ -828,22 +337,11 @@ def build_player_matchup_history(
 ) -> pd.DataFrame:
     """
     Build head-to-head player vs opponent team history.
-    
-    Args:
-        shots_df: DataFrame with shot data
-        player_col: Column with player IDs
-        team_col: Column with team codes
-        game_col: Column with game IDs
-        sog_col: Column with SOG indicator
-        min_games: Minimum games for reliable h2h stats
-        
-    Returns:
-        DataFrame with head-to-head statistics
     """
     if player_col not in shots_df.columns or team_col not in shots_df.columns:
         print(f"Warning: Required columns missing for h2h history: {player_col}, {team_col}")
         return pd.DataFrame()  # Return empty DataFrame
-        
+    
     try:
         # Create a copy of the dataframe to avoid modifying the original
         shots = shots_df.copy()
@@ -863,15 +361,11 @@ def build_player_matchup_history(
                     teams[1]: teams[0]
                 }
         
-        # Add opponent column to shots_df
-        opponent_list = []
-        for _, row in shots.iterrows():
-            game_id = row[game_col]
-            team = row[team_col]
-            opponent = game_opponents.get(game_id, {}).get(team, None)
-            opponent_list.append(opponent)
-        
-        shots['opponent'] = opponent_list
+        # Add opponent column to shots
+        shots['opponent'] = shots.apply(
+            lambda row: game_opponents.get(row[game_col], {}).get(row[team_col]),
+            axis=1
+        )
         
         # Filter out rows with missing opponents
         shots = shots.dropna(subset=['opponent'])
@@ -898,10 +392,349 @@ def build_player_matchup_history(
         
         # Filter by minimum games for reliability
         return h2h_stats[h2h_stats['h2h_games'] >= min_games]
+    
     except Exception as e:
         print(f"Error building head-to-head history: {e}")
         return pd.DataFrame()
 
+def apply_opponent_context_with_h2h(
+    mu_df: pd.DataFrame,
+    opponent_df: pd.DataFrame,
+    h2h_df: pd.DataFrame,  # Head-to-head stats
+    league_avg_tempo: float,
+    league_avg_sa_per_game: float,
+    player_col: str = "shooterPlayerId",
+    team_col: str = "teamCode",
+    opponent_col: str = "opponent",
+    h2h_weight: float = 0.3  # Weight for head-to-head data
+) -> pd.DataFrame:
+    """
+    Apply opponent context adjustments to player mean and std,
+    incorporating head-to-head history.
+    """
+    # Cross join players with opponents
+    players = mu_df.copy()
+    opp = opponent_df.copy()
+    
+    # Create a key for joining
+    players["key"] = 1
+    opp["key"] = 1
+    
+    # Cross join
+    df = pd.merge(players, opp, on="key", suffixes=("", "_opp"))
+    df = df.drop(columns=["key"])
+    
+    # Rename opponent columns for clarity
+    df = df.rename(columns={
+        f"{team_col}_opp": opponent_col,
+        "tempo_opp": "tempo",
+        "sa_per_game_opp": "sa_per_game",
+        "block_rate_opp": "block_rate",
+    })
+    
+    # Apply pace multiplier
+    df["mu_pace"] = df["mu"] * (df["tempo"] / league_avg_tempo)
+    
+    # Apply SA/GP adjustment
+    sa_diff = df["sa_per_game"] - league_avg_sa_per_game
+    df["mu_sa"] = df["mu_pace"] + np.where(abs(sa_diff) >= 2, 0.15 * (sa_diff / 2), 0)
+    
+    # Apply block rate adjustment
+    df["mu_block"] = df["mu_sa"] + np.where(
+        df["block_rate"] > 0.30, -0.25,
+        np.where(df["block_rate"] < 0.22, 0.15, 0)
+    )
+    
+    df["sigma_block"] = df["sigma"] * np.where(df["block_rate"] > 0.30, 1.1, 1.0)
+    
+    # Incorporate head-to-head data
+    if not h2h_df.empty:
+        # Merge h2h data
+        df = df.merge(
+            h2h_df[[player_col, opponent_col, 'h2h_mu', 'h2h_games']],
+            on=[player_col, opponent_col],
+            how='left'
+        )
+        
+        # Apply h2h adjustment where data exists
+        h2h_mask = df['h2h_mu'].notna()
+        
+        if h2h_mask.any():
+            # Calculate confidence factor based on number of h2h games
+            df.loc[h2h_mask, 'h2h_confidence'] = np.minimum(
+                df.loc[h2h_mask, 'h2h_games'] / 10, 1.0
+            )
+            
+            # Apply weighted blend
+            df.loc[h2h_mask, 'mu_h2h'] = (
+                (1 - (h2h_weight * df.loc[h2h_mask, 'h2h_confidence'])) * df.loc[h2h_mask, 'mu_block'] +
+                (h2h_weight * df.loc[h2h_mask, 'h2h_confidence']) * df.loc[h2h_mask, 'h2h_mu']
+            )
+        else:
+            df['mu_h2h'] = df['mu_block']
+    else:
+        # No h2h data available
+        df['mu_h2h'] = df['mu_block']
+    
+    # Apply shutdown matchup flag
+    if "is_shadowed" in df.columns:
+        df["mu_shadow"] = df["mu_h2h"] + np.where(df["is_shadowed"], -0.25, 0)
+    else:
+        df["mu_shadow"] = df["mu_h2h"]
+    
+    # Calculate final mu/sigma with all opponent context
+    df["mu_opponent"] = df["mu_shadow"]
+    df["sigma_opponent"] = df["sigma_block"]
+    
+    # Select relevant columns
+    result_df = df[[
+        player_col, team_col, opponent_col, 
+        "mu", "sigma", "mu_opponent", "sigma_opponent"
+    ]]
+    
+    return result_df
+
+def apply_game_state_adjustments(
+    proj_df: pd.DataFrame,
+    game_state: pd.DataFrame,
+    player_col: str = "shooterPlayerId",
+    team_col: str = "teamCode",
+) -> pd.DataFrame:
+    """
+    Apply game-state adjustments to player mean and std.
+    """
+    df = proj_df.merge(game_state, on=[player_col, team_col], how="left")
+    
+    # Lead-protect taper
+    lead_protect = (
+        (df["period"] > 2) & 
+        (df["score_diff"] >= 2) & 
+        (df["is_top_shooter"] == True)
+    )
+    df["mu_lead"] = df["mu_opponent"] + np.where(lead_protect, -0.3, 0)
+    
+    # Chase-mode bonus
+    chase_mode = (
+        ((df["trail_probability"] >= 0.6) | (df["score_diff"] < 0)) & 
+        (df["is_star"] == True)
+    )
+    df["mu_chase"] = df["mu_lead"] + np.where(chase_mode, 0.4, 0)
+    
+    # Overtime/comeback for Canes
+    canes_bonus = (
+        (df[team_col] == "CAR") & 
+        ((df["is_overtime"] == True) | (df["score_diff"] <= -2)) & 
+        (df["is_top_six"] == True)
+    )
+    df["mu_canes"] = df["mu_chase"] + np.where(canes_bonus, 0.3, 0)
+    
+    # Increase variance in OT
+    df["sigma_ot"] = df["sigma_opponent"] * np.where(df["is_overtime"], 1.15, 1.0)
+    
+    # Calculate final game-state adjusted mu/sigma
+    df["mu_game_state"] = df["mu_canes"]
+    df["sigma_game_state"] = df["sigma_ot"]
+    
+    return df
+
+def apply_advanced_game_state_adjustments(
+    proj_df: pd.DataFrame,
+    game_state: pd.DataFrame,
+    situational_model: Optional[Any] = None,
+    player_col: str = "shooterPlayerId",
+    team_col: str = "teamCode",
+) -> pd.DataFrame:
+    """
+    Apply advanced game-state adjustments to player mean and std using
+    both rules-based and model-based approaches.
+    """
+    # Start with basic game state adjustments
+    df = apply_game_state_adjustments(proj_df, game_state)
+    
+    # Apply model-based adjustments if model is provided
+    if situational_model is not None and situational_model.trained:
+        for idx, row in df.iterrows():
+            player_id = row[player_col]
+            period = game_state.loc[idx, 'period'] if idx in game_state.index else 3
+            score_diff = game_state.loc[idx, 'score_diff'] if idx in game_state.index else 0
+            time_remaining = game_state.loc[idx, 'time_remaining'] if 'time_remaining' in game_state.columns and idx in game_state.index else 600
+            is_overtime = game_state.loc[idx, 'is_overtime'] if idx in game_state.index else False
+            
+            # Get model prediction
+            adjustment = situational_model.predict_adjustment(
+                player_id=player_id,
+                period=period,
+                score_diff=score_diff,
+                time_remaining=time_remaining,
+                is_overtime=is_overtime
+            )
+            
+            # Apply adjustments
+            df.loc[idx, 'mu_situation'] = df.loc[idx, 'mu_game_state'] + adjustment['mean_adj']
+            df.loc[idx, 'sigma_situation'] = df.loc[idx, 'sigma_game_state'] * adjustment['sigma_factor']
+    else:
+        # No model, use existing values
+        df['mu_situation'] = df['mu_game_state']
+        df['sigma_situation'] = df['sigma_game_state']
+    
+    # Advanced coach-specific adjustments
+    if 'coach_id' in game_state.columns:
+        # This would use a lookup table of coach tendencies
+        coach_tendencies = {
+            # Example: coach ID -> adjustment factor for 3rd period trailing
+            'c001': 0.2,  # Coach pulls goalie earlier, more aggressive
+            'c002': -0.1,  # Coach is more defensive when trailing
+        }
+        
+        for idx, row in df.iterrows():
+            if idx in game_state.index:
+                coach_id = game_state.loc[idx, 'coach_id']
+                if coach_id in coach_tendencies and game_state.loc[idx, 'period'] >= 3:
+                    if game_state.loc[idx, 'score_diff'] < 0:  # Trailing
+                        df.loc[idx, 'mu_situation'] += coach_tendencies[coach_id]
+    
+    # Set final game-state adjusted mu/sigma
+    df['mu_game_state_final'] = df['mu_situation']
+    df['sigma_game_state_final'] = df['sigma_situation']
+    
+    return df
+
+def apply_player_specific_quirks(
+    proj_df: pd.DataFrame,
+    player_col: str = "shooterPlayerId",
+) -> pd.DataFrame:
+    """
+    Apply player-specific quirks to mean and std.
+    """
+    df = proj_df.copy()
+    
+    # High-post shooters
+    if "is_high_post_shooter" in df.columns:
+        df["mu_post"] = df["mu_game_state"] + np.where(df["is_high_post_shooter"], -0.05, 0)
+        df["sigma_post"] = df["sigma_game_state"] * np.where(df["is_high_post_shooter"], 1.1, 1.0)
+    else:
+        # Default if column doesn't exist
+        df["mu_post"] = df["mu_game_state"]
+        df["sigma_post"] = df["sigma_game_state"]
+    
+    # Power-play share
+    if "actual_pp" in df.columns and "expected_pp" in df.columns:
+        pp_diff = df["actual_pp"] - df["expected_pp"]
+        df["mu_pp"] = df["mu_post"] + 0.15 * (pp_diff / 2)
+    else:
+        # Default if columns don't exist
+        df["mu_pp"] = df["mu_post"]
+    
+    # Rolling last-game EV-TOI
+    df["toi_factor"] = 1.0
+    
+    # Where we have both last game TOI and average TOI
+    if "last_game_ev_toi" in df.columns and "avg_ev_toi" in df.columns:
+        mask = (df["last_game_ev_toi"].notna()) & (df["avg_ev_toi"] > 0)
+        df.loc[mask, "toi_factor"] = df.loc[mask, "last_game_ev_toi"] / df.loc[mask, "avg_ev_toi"]
+    
+    # Apply TOI factor to mean
+    df["mu_toi"] = df["mu_pp"] * df["toi_factor"]
+    
+    # Calculate final player-specific adjusted mu/sigma
+    df["mu_player"] = df["mu_toi"]
+    df["sigma_player"] = df["sigma_post"]
+    
+    return df
+
+def calculate_final_projection(
+    player_df: pd.DataFrame,
+    player_col: str = "shooterPlayerId",
+) -> pd.DataFrame:
+    """
+    Calculate final projections for all players.
+    """
+    # Ensure all adjustment columns exist
+    result_df = player_df.copy()
+    
+    if "mu_opponent" not in result_df.columns:
+        result_df["mu_opponent"] = result_df["mu"]
+        result_df["sigma_opponent"] = result_df["sigma"]
+    
+    if "mu_game_state" not in result_df.columns:
+        result_df["mu_game_state"] = result_df["mu_opponent"]
+        result_df["sigma_game_state"] = result_df["sigma_opponent"]
+    
+    if "mu_player" not in result_df.columns:
+        result_df["mu_player"] = result_df["mu_game_state"]
+        result_df["sigma_player"] = result_df["sigma_game_state"]
+    
+    # Set final values
+    result_df["mu_final"] = result_df["mu_player"]
+    result_df["sigma_final"] = result_df["sigma_player"]
+    
+    # Select relevant columns for output
+    cols_to_keep = [
+        player_col, "teamCode"
+    ]
+    
+    # Add opponent if it exists
+    if "opponent" in result_df.columns:
+        cols_to_keep.append("opponent")
+    
+    # Add all mu/sigma columns
+    mu_sigma_cols = [
+        "mu", "sigma",                          # Base weighted stats
+        "mu_opponent", "sigma_opponent",        # After opponent context
+        "mu_game_state", "sigma_game_state",    # After game state
+        "mu_player", "sigma_player",            # After player quirks
+        "mu_final", "sigma_final"               # Final values
+    ]
+    
+    # Add columns that exist
+    for col in mu_sigma_cols:
+        if col in result_df.columns:
+            cols_to_keep.append(col)
+    
+    return result_df[cols_to_keep]
+
+def calculate_final_projection_with_confidence(
+    player_df: pd.DataFrame,
+    lines: List[float] = [0.5, 1.5, 2.5, 3.5, 4.5],
+    confidence_levels: List[float] = [0.80, 0.90, 0.95],
+    player_col: str = "shooterPlayerId"
+) -> pd.DataFrame:
+    """
+    Calculate final projections for all players with confidence intervals.
+    """
+    # Start with standard final projection
+    result_df = calculate_final_projection(player_df, player_col)
+    
+    # Add probabilities for each line
+    for line in lines:
+        line_str = str(line).replace('.', '_')
+        result_df[f'p_over_{line_str}'] = result_df.apply(
+            lambda row: stats.norm.sf(line + 0.5, loc=row['mu_final'], scale=row['sigma_final']),
+            axis=1
+        )
+    
+    # Calculate confidence intervals
+    for i, row in result_df.iterrows():
+        # Store confidence intervals for a representative line (e.g., 2.5)
+        key_line = 2.5
+        key_line_str = '2_5'
+        
+        intervals = calculate_confidence_intervals(
+            mu=row['mu_final'],
+            sigma=row['sigma_final'],
+            line=key_line,
+            confidence_levels=confidence_levels
+        )
+        
+        # Add confidence intervals to result
+        for level in confidence_levels:
+            level_str = str(int(level * 100))
+            result_df.at[i, f'mu_lower_{level_str}'] = intervals['intervals'][level]['mean_lower']
+            result_df.at[i, f'mu_upper_{level_str}'] = intervals['intervals'][level]['mean_upper']
+            result_df.at[i, f'p_over_{key_line_str}_lower_{level_str}'] = intervals['intervals'][level]['prob_lower']
+            result_df.at[i, f'p_over_{key_line_str}_upper_{level_str}'] = intervals['intervals'][level]['prob_upper']
+    
+    return result_df
 
 def calculate_confidence_intervals(
     mu: float,
@@ -911,18 +744,7 @@ def calculate_confidence_intervals(
 ) -> Dict[str, Dict[str, float]]:
     """
     Calculate confidence intervals for SOG predictions.
-    
-    Args:
-        mu: Mean SOG projection
-        sigma: Standard deviation
-        line: SOG line
-        confidence_levels: List of confidence levels (0-1)
-        
-    Returns:
-        Dictionary with confidence intervals
     """
-    from scipy import stats
-    
     results = {
         'probability': stats.norm.sf(line + 0.5, loc=mu, scale=sigma),
         'intervals': {}
