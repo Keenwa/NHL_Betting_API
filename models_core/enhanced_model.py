@@ -5,7 +5,7 @@ from typing import Dict, List, Tuple, Optional, Any
 import os
 import glob
 
-from shot_features import (
+from models_core.shot_features import (
     load_shot_data, 
     process_shots,
     compute_dynamic_weighted_mu_sigma,
@@ -18,7 +18,7 @@ from shot_features import (
     validate_shot_data_integrity
 )
 
-from game_state_model import SituationalModel
+from models_core.game_state_model import SituationalModel
 
 class EnhancedSOGModel:
     """
@@ -150,76 +150,60 @@ class EnhancedSOGModel:
             # Empty h2h stats
             self.h2h_stats = pd.DataFrame()
     
-    def _load_opponent_stats(self):
-        """Load opponent team statistics from file or calculate from data."""
-        # Check if opponent stats file exists
-        opponent_file = os.path.join(self.data_dir, "opponent_stats.csv")
-        
-        if os.path.exists(opponent_file):
-            # Load from file
-            self.opponent_stats = pd.read_csv(opponent_file)
-        else:
-            # Calculate from shot data
-            print("Calculating opponent statistics from shot data...")
-            self.opponent_stats = self._calculate_opponent_stats()
-            
-            # Save for future use
-            self.opponent_stats.to_csv(opponent_file, index=False)
-    
-    def _calculate_opponent_stats(self):
-        """Calculate opponent statistics from shot data."""
-    # First, calculate shots per game for each team
-    team_shots = self.processed_shots.groupby(['teamCode', 'game_id']).size().reset_index(name='shots')
-    shots_per_game = team_shots.groupby('teamCode')['shots'].mean().reset_index(name='shots_per_game')
-    
-    # Calculate average tempo by team (events per game)
-    games_per_team = team_shots.groupby('teamCode')['game_id'].nunique().reset_index(name='games')
-    
-    # Group by team to calculate stats
-    team_stats = pd.DataFrame()
-    
-    # For each team, calculate:
-    for team in self.processed_shots['teamCode'].unique():
-        # Get team shots
-        team_sog = self.processed_shots[self.processed_shots['teamCode'] == team]['is_sog'].sum()
-        team_blocks = self.processed_shots[self.processed_shots['teamCode'] == team]['is_block'].sum()
-        
-        # Safely calculate block rate
-        block_rate = 0.0
-        if team_sog + team_blocks > 0:
-            block_rate = team_blocks / (team_sog + team_blocks)
-        
-        # Get shots per game
-        if team in shots_per_game['teamCode'].values:
-            spg = shots_per_game.loc[shots_per_game['teamCode'] == team, 'shots_per_game'].iloc[0]
-        else:
-            spg = 0.0
-        
-        # Get number of games
-        if team in games_per_team['teamCode'].values:
-            games = games_per_team.loc[games_per_team['teamCode'] == team, 'games'].iloc[0]
-        else:
-            games = 1
-        
-        # Calculate tempo (approximate)
-        tempo = 60.0  # Default value
-        if games > 0:
-            tempo = len(self.processed_shots[self.processed_shots['teamCode'] == team]) / games
-        
-        # Add to team stats
-        team_stats = pd.concat([
-            team_stats,
-            pd.DataFrame({
-                'teamCode': [team],
-                'tempo': [tempo],
-                'sa_per_game': [spg],
-                'block_rate': [block_rate],
-                'pp_time_share': [0.2],  # Default value
-                'pk_weakness': [0.8]     # Default value
-            })
-        ], ignore_index=True)
-    
-    return team_stats
+    def _calculate_opponent_stats(self) -> pd.DataFrame:
+        """Derive tempo, SA/GP, block‑rate, etc. for every opponent."""
+        # ── shots / game ───────────────────────────────────────────────
+        team_shots = (
+            self.processed_shots
+            .groupby(['teamCode', 'game_id'])
+            .size()
+            .reset_index(name='shots')
+        )
+        shots_per_game = (
+            team_shots
+            .groupby('teamCode')['shots']
+            .mean()
+            .reset_index(name='shots_per_game')
+        )
+
+        # ── games played per team (used for tempo) ─────────────────────
+        games_per_team = (
+            team_shots
+            .groupby('teamCode')['game_id']
+            .nunique()
+            .reset_index(name='games')
+        )
+
+        # ── accumulate rows here, then build one DataFrame at the end ──
+        rows = []
+
+        for team in self.processed_shots['teamCode'].unique():
+            team_mask   = self.processed_shots['teamCode'] == team
+            team_sog    = self.processed_shots.loc[team_mask, 'is_sog'].sum()
+            team_blocks = self.processed_shots.loc[team_mask, 'is_block'].sum()
+
+            block_rate = team_blocks / (team_sog + team_blocks) if (team_sog + team_blocks) else 0.0
+            spg        = shots_per_game.loc[
+                            shots_per_game['teamCode'] == team, 'shots_per_game'
+                         ].squeeze() if team in shots_per_game['teamCode'].values else 0.0
+            games      = games_per_team.loc[
+                            games_per_team['teamCode'] == team, 'games'
+                         ].squeeze() if team in games_per_team['teamCode'].values else 1
+            tempo      = len(self.processed_shots[team_mask]) / games if games else 60.0
+
+            rows.append(
+                {
+                    'teamCode'     : team,
+                    'tempo'        : tempo,
+                    'sa_per_game'  : spg,
+                    'block_rate'   : block_rate,
+                    'pp_time_share': 0.20,  # TODO: replace with real PP data
+                    'pk_weakness'  : 0.80,  # TODO: replace with real PK metric
+                }
+            )
+
+        # Build and return the final table
+        return pd.DataFrame(rows)
     
     def _train_situational_model(self):
         """Train the situational model on historical data."""
