@@ -1,9 +1,9 @@
 import pandas as pd
 import numpy as np
 from scipy import stats
-from enhanced_model import EnhancedSOGModel
+from models_core.enhanced_model import EnhancedSOGModel
 from model_validation import SOGModelValidator
-import backtest_utils
+import models_core.backtest_utils as backtest_utils
 
 def main():
     # Initialize model
